@@ -1,228 +1,193 @@
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
 import { fetchElectionPrediction } from './geminiService';
-import { PredictionData, MockPost, UserFeedback } from './types';
+import { PredictionData, MockPost } from './types';
 import PredictorCard from './components/PredictorCard';
+
+declare global {
+  interface Window {
+    onYouTubeIframeAPIReady: () => void;
+    YT: any;
+  }
+}
+
+const DEFAULT_SYNC_INTERVAL = 180; // 3 minutes for safer rate limits
+const BACKOFF_SYNC_INTERVAL = 300; // 5 minutes on error
+
+const MemoizedPredictorCard = memo(PredictorCard);
 
 const App: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<PredictionData | null>(null);
   const [history, setHistory] = useState<MockPost[]>([]);
-  const [error, setError] = useState<{ message: string; type: string } | null>(null);
-  const [showSuccess, setShowSuccess] = useState(false);
-  const [electionDate] = useState("12th February 2026");
-  const [timeLeft, setTimeLeft] = useState({ hours: 0, minutes: 0, seconds: 0 });
-  const [nextApiUpdate, setNextApiUpdate] = useState(60); // Increased to 60s to avoid 429
-  const [isPlaying, setIsPlaying] = useState(true); // Default ON as requested
+  const [error, setError] = useState<string | null>(null);
+  const [nextApiUpdate, setNextApiUpdate] = useState(DEFAULT_SYNC_INTERVAL); 
+  const [isPlaying, setIsPlaying] = useState(true); 
+  const [isCoolingDown, setIsCoolingDown] = useState(false);
   
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const playerRef = useRef<any>(null);
   const lastFetchRef = useRef<number>(0);
 
-  // Initialize history from localStorage
   useEffect(() => {
-    const savedHistory = localStorage.getItem('vbd_sentiment_history');
-    if (savedHistory) setHistory(JSON.parse(savedHistory));
-  }, []);
+    const saved = localStorage.getItem('vbd_sentiment_history');
+    if (saved) setHistory(JSON.parse(saved));
 
-  useEffect(() => {
-    localStorage.setItem('vbd_sentiment_history', JSON.stringify(history.slice(0, 50)));
-  }, [history]);
-
-  // Handle default audio play - browser interaction might still be required
-  useEffect(() => {
-    if (isPlaying && audioRef.current) {
-      const playPromise = audioRef.current.play();
-      if (playPromise !== undefined) {
-        playPromise.catch(() => {
-          console.log("Autoplay blocked. Will start on first user click.");
-        });
-      }
+    if (!window.YT) {
+      const tag = document.createElement('script');
+      tag.src = "https://www.youtube.com/iframe_api";
+      const firstScriptTag = document.getElementsByTagName('script')[0];
+      firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
     }
-  }, []);
 
-  // Countdown timer - efficient 1s interval
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const now = new Date();
-      const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
-      const diff = endOfDay.getTime() - now.getTime();
-
-      if (diff > 0) {
-        setTimeLeft({
-          hours: Math.floor((diff / (1000 * 60 * 60)) % 24),
-          minutes: Math.floor((diff / 1000 / 60) % 60),
-          seconds: Math.floor((diff / 1000) % 60),
-        });
-      }
-    }, 1000);
-    return () => clearInterval(timer);
+    window.onYouTubeIframeAPIReady = () => {
+      playerRef.current = new window.YT.Player('youtube-player', {
+        height: '0', width: '0', videoId: '2lH1WEGZoD8',
+        playerVars: { autoplay: 1, loop: 1, controls: 0, playlist: '2lH1WEGZoD8' },
+        events: { onReady: (e: any) => isPlaying && e.target.playVideo() }
+      });
+    };
   }, []);
 
   const runPrediction = useCallback(async (isAuto = false) => {
     const now = Date.now();
-    // Conservative throttle: 60s for auto-updates to strictly avoid 429 Resource Exhausted
-    if (isAuto && now - lastFetchRef.current < 60000) return;
+    // Prevent overlapping requests
+    if (loading) return;
+    // Debounce/Throttle: Ensure at least 60s between any request
+    if (now - lastFetchRef.current < 60000) return;
 
     if (!isAuto && !data) setLoading(true);
     setError(null);
     
     try {
       lastFetchRef.current = now;
-      const result = await fetchElectionPrediction(electionDate);
+      const result = await fetchElectionPrediction("12th February 2026");
       setData(result);
+      setIsCoolingDown(false);
       setHistory(prev => {
         const newPosts = result.sentimentFeed.filter(np => !prev.some(p => p.content === np.content));
-        return [...newPosts, ...prev].slice(0, 50);
+        const merged = [...newPosts, ...prev].slice(0, 20);
+        localStorage.setItem('vbd_sentiment_history', JSON.stringify(merged));
+        return merged;
       });
-      setShowSuccess(true);
-      setNextApiUpdate(60);
-      setTimeout(() => setShowSuccess(false), 2000);
+      setNextApiUpdate(DEFAULT_SYNC_INTERVAL);
     } catch (err: any) {
-      console.error("Prediction Error:", err);
-      // Only show error on manual trigger; auto-fails are silent to maintain app flow
-      if (!isAuto) {
-        setError({ 
-          message: "The search engine is under heavy load. We have slowed down updates to prevent blocking.", 
-          type: "Rate Limit (429)" 
-        });
+      console.error("Fetch failed:", err);
+      const isRateLimit = err.message?.includes("429") || err.message?.includes("quota");
+      
+      if (isRateLimit) {
+        setIsCoolingDown(true);
+        setNextApiUpdate(BACKOFF_SYNC_INTERVAL);
+        setError("Rate limit reached. Entering cool-down mode to protect API quota.");
+      } else {
+        setError("Failed to fetch latest data. Please check your connection.");
       }
     } finally {
       setLoading(false);
     }
-  }, [electionDate, data]);
+  }, [data, loading]);
 
-  // UI Tick every 10s - Visual feedback only, API called every 60s
   useEffect(() => {
     const uiInterval = setInterval(() => {
-      setNextApiUpdate(prev => {
-        if (prev <= 10) {
-          runPrediction(true);
-          return 60;
+      setNextApiUpdate(p => {
+        if (p <= 1) { 
+          runPrediction(true); 
+          return isCoolingDown ? BACKOFF_SYNC_INTERVAL : DEFAULT_SYNC_INTERVAL; 
         }
-        return prev - 10;
+        return p - 1;
       });
-
-      // Quick visual shuffle for "live" feel without needing new API data
-      if (data?.sentimentFeed) {
-        setData(prev => {
-          if (!prev) return null;
-          return { 
-            ...prev, 
-            sentimentFeed: [...prev.sentimentFeed].sort(() => Math.random() - 0.5) 
-          };
-        });
-      }
-    }, 10000); 
-
+    }, 1000); 
     return () => clearInterval(uiInterval);
-  }, [runPrediction, data]);
+  }, [runPrediction, isCoolingDown]);
 
-  useEffect(() => {
-    runPrediction();
+  useEffect(() => { 
+    // Initial fetch
+    runPrediction(); 
   }, []);
 
   const toggleMusic = () => {
-    if (!audioRef.current) return;
-    if (isPlaying) {
-      audioRef.current.pause();
-    } else {
-      audioRef.current.play().catch(() => {});
-    }
+    if (!playerRef.current) return;
+    isPlaying ? playerRef.current.pauseVideo() : playerRef.current.playVideo();
     setIsPlaying(!isPlaying);
   };
 
   return (
-    <div className="min-h-screen pb-20 overflow-x-hidden">
-      <audio 
-        ref={audioRef} 
-        loop 
-        src="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3" 
-      />
+    <div className="min-h-screen pb-10 overflow-x-hidden bg-slate-50 antialiased">
+      <div id="youtube-player" className="hidden"></div>
 
-      <div className="bg-slate-900 text-white py-2 px-6 flex justify-between items-center sticky top-0 z-[60] shadow-xl border-b border-emerald-500/30 backdrop-blur-md bg-opacity-95">
-        <div className="flex items-center gap-4">
+      <div className={`py-2 px-6 flex justify-between items-center sticky top-0 z-50 shadow-md transition-colors duration-500 ${isCoolingDown ? 'bg-amber-600 text-white' : 'bg-slate-900 text-white'}`}>
+        <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">
-              UI Refresh: 10s | Next API: {nextApiUpdate}s
+            <span className={`w-2 h-2 rounded-full animate-pulse ${isCoolingDown ? 'bg-white' : 'bg-emerald-500'}`}></span>
+            <span className="text-[10px] font-bold uppercase tracking-widest">
+              {isCoolingDown ? `COOL-DOWN: ${nextApiUpdate}S` : `SYNC: ${nextApiUpdate}S`}
             </span>
           </div>
-          <button 
-            onClick={toggleMusic}
-            className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase transition-all ${isPlaying ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-400'}`}
-          >
-            <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-            {isPlaying ? 'Nouka Anthem ON' : 'Nouka Anthem OFF'}
+          <button onClick={toggleMusic} className={`text-[10px] font-black px-2 py-1 rounded border uppercase transition-colors ${isCoolingDown ? 'bg-white/20 border-white/40 text-white' : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'}`}>
+            {isPlaying ? 'Audio On' : 'Audio Off'}
           </button>
         </div>
-        <div className="font-mono text-lg font-bold">
-           <span className="text-emerald-400">{String(timeLeft.hours).padStart(2, '0')}:{String(timeLeft.minutes).padStart(2, '0')}:{String(timeLeft.seconds).padStart(2, '0')}</span>
-        </div>
+        <div className="font-mono text-xs font-bold opacity-80">{new Date().toLocaleTimeString()}</div>
       </div>
 
-      <nav className="bg-white/80 backdrop-blur-md border-b border-slate-200 py-4 px-6 mb-8 shadow-sm">
-        <div className="max-w-7xl mx-auto flex justify-between items-center">
+      <nav className="bg-white border-b border-slate-200 py-3 px-6 mb-6">
+        <div className="max-w-4xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-2">
-            <div className="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-200">
-              <span className="text-white font-bold text-xl italic">V</span>
+            <div className="w-8 h-8 bg-emerald-600 rounded flex items-center justify-center shadow-lg">
+              <span className="text-white font-black">V</span>
             </div>
-            <h1 className="text-xl font-bold text-slate-900 tracking-tight">VoteSphere <span className="text-emerald-600">BD</span></h1>
+            <h1 className="font-bold text-slate-900">VoteSphere<span className="text-emerald-600">BD</span></h1>
           </div>
-          <div className="text-[10px] font-black uppercase text-slate-400">Grounding intelligence • {history.length} Logs</div>
+          <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Election Predictor 2026</span>
         </div>
       </nav>
 
-      <main className="max-w-6xl mx-auto px-6 relative">
+      <main className="max-w-4xl mx-auto px-6">
         {loading && !data && (
-          <div className="flex flex-col items-center justify-center py-20">
-            <div className="w-10 h-10 border-2 border-emerald-100 border-t-emerald-600 rounded-full animate-spin mb-4"></div>
-            <p className="text-slate-900 font-bold text-xs tracking-widest uppercase">Optimizing Analysis...</p>
+          <div className="flex flex-col items-center justify-center py-24">
+            <div className="w-8 h-8 border-2 border-emerald-100 border-t-emerald-600 rounded-full animate-spin mb-4"></div>
+            <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Analyzing Social Pulse...</p>
           </div>
         )}
 
         {error && (
-          <div className="bg-white border border-rose-200 p-8 rounded-3xl shadow-xl max-w-2xl mx-auto text-center animate-in slide-in-from-top-4 mb-8">
-            <h4 className="text-2xl font-black text-slate-900 mb-2">{error.type}</h4>
-            <p className="text-slate-600 mb-8 leading-relaxed">{error.message}</p>
-            <button 
-              onClick={() => runPrediction()} 
-              className="px-8 py-3 bg-slate-900 text-white rounded-xl font-bold hover:bg-slate-800 transition-colors"
-            >
-              Retry Manual Scan
-            </button>
+          <div className={`p-4 rounded-xl text-center mb-6 border ${isCoolingDown ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-rose-50 border-rose-200 text-rose-800'}`}>
+            <p className="text-xs font-bold mb-3">{error}</p>
+            {!isCoolingDown && (
+              <button onClick={() => runPrediction()} className="text-[10px] font-bold px-4 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition-colors">
+                Retry Manually
+              </button>
+            )}
+            {isCoolingDown && (
+              <p className="text-[10px] opacity-75 italic">System will resume automatically once the cool-down period ends.</p>
+            )}
           </div>
         )}
 
         {data && (
-          <div className="animate-in fade-in slide-in-from-bottom-6 duration-500 space-y-10">
-            {/* Cleaned up bar - Overlapping text removed per request */}
-            <div className="flex items-center justify-between p-3 px-5 bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden relative">
-              <div className="flex items-center gap-3">
-                 <div className="w-2.5 h-2.5 bg-red-500 rounded-full animate-pulse"></div>
-                 <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Live Pulse Scanning</span>
-              </div>
-              <span className="text-slate-400 font-mono text-[10px]">{data.timestamp}</span>
-            </div>
+          <div className="space-y-6 animate-in fade-in duration-700">
+            <MemoizedPredictorCard data={data} />
 
-            <PredictorCard data={data} />
-
-            <div className="bg-slate-50 rounded-3xl p-6 border border-slate-200">
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-bold text-slate-800">Recent Sentiment Archive</h3>
-                <span className="text-[9px] text-slate-400 font-bold uppercase tracking-widest">{history.length} Saved Snapshots</span>
+                <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Real-time Sentiment Stream</h3>
+                <div className="flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                  <span className="text-[8px] font-bold text-emerald-600">LIVE</span>
+                </div>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                {history.slice(0, 9).map((post, idx) => (
-                  <div key={idx} className="bg-white p-3 rounded-xl border border-slate-100 shadow-sm transition-all hover:shadow-md">
-                    <div className="flex justify-between items-center mb-1.5">
-                      <span className="text-[8px] font-bold uppercase text-slate-400">{post.username}</span>
-                      <span className={`text-[8px] font-black uppercase px-1 py-0.5 rounded ${
-                        post.sentiment === 'pro-al' ? 'bg-emerald-50 text-emerald-600' :
-                        post.sentiment === 'pro-bnp' ? 'bg-yellow-50 text-yellow-600' :
-                        'bg-teal-50 text-teal-600'
-                      }`}>{post.sentiment.replace('pro-', '')}</span>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {history.slice(0, 4).map((post, idx) => (
+                  <div key={idx} className="p-4 rounded-xl border border-slate-100 bg-slate-50/50 text-[11px] transition-all hover:bg-white hover:shadow-md">
+                    <div className="flex justify-between items-center mb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="w-5 h-5 rounded-full bg-slate-200 flex items-center justify-center text-[9px] font-bold">{post.username.charAt(0)}</span>
+                        <span className="font-bold text-slate-700">{post.username}</span>
+                      </div>
+                      <span className={`px-1.5 py-0.5 rounded text-[8px] font-black uppercase ${post.sentiment === 'pro-al' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-600'}`}>
+                        {post.sentiment.replace('pro-', '')}
+                      </span>
                     </div>
-                    <p className="text-[11px] text-slate-600 leading-relaxed italic line-clamp-2">"{post.content}"</p>
+                    <p className="text-slate-600 italic leading-relaxed">"{post.content}"</p>
                   </div>
                 ))}
               </div>
@@ -231,25 +196,20 @@ const App: React.FC = () => {
         )}
       </main>
 
-      <div className="fixed bottom-6 left-6 z-[100]">
-        <div 
-          onClick={toggleMusic}
-          className={`p-3 pr-5 rounded-2xl shadow-2xl flex items-center gap-4 cursor-pointer transition-all hover:scale-105 active:scale-95 ${isPlaying ? 'bg-emerald-600' : 'bg-slate-800'}`}
-        >
+      <div className="fixed bottom-6 right-6 z-50">
+        <div onClick={toggleMusic} className={`p-3 pr-5 rounded-2xl shadow-2xl flex items-center gap-4 cursor-pointer transition-all hover:scale-105 active:scale-95 ${isPlaying ? 'bg-emerald-600' : 'bg-slate-800'}`}>
           <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
             {isPlaying ? (
               <div className="flex gap-1 items-end h-3">
-                <div className="w-1 bg-white animate-[bounce_0.6s_infinite] h-1.5"></div>
-                <div className="w-1 bg-white animate-[bounce_0.8s_infinite] h-3"></div>
-                <div className="w-1 bg-white animate-[bounce_0.7s_infinite] h-2"></div>
+                <div className="w-1 bg-white animate-pulse h-1.5"></div>
+                <div className="w-1 bg-white animate-pulse h-3"></div>
+                <div className="w-1 bg-white animate-pulse h-2"></div>
               </div>
-            ) : (
-              <svg className="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-            )}
+            ) : <svg className="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>}
           </div>
           <div className="text-white">
-            <p className="text-[9px] font-black uppercase tracking-widest opacity-80">Rally Anthem</p>
-            <p className="text-xs font-bold truncate max-w-[150px]">Joy Bangla Jitbe Eibar Nouka</p>
+            <p className="text-[9px] font-black opacity-70 uppercase tracking-widest">Nouka Anthem</p>
+            <p className="text-[11px] font-bold">Joy Bangla Jitbe</p>
           </div>
         </div>
       </div>
